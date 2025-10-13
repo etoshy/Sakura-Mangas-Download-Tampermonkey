@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SakuraMangas Auto Downloader
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Adiciona botão "Download". Usa rolagem controlada para carregar e depois baixa as URLs reais.
+// @version      2.2
+// @description  Adiciona botão "Download". Intercepta e armazena as imagens enquanto são carregadas.
 // @author       Etoshy
 // @match        https://sakuramangas.org/obras/*/*/
 // @icon         https://sakuramangas.org/favicon.ico
@@ -13,6 +13,27 @@
 
 (function() {
     'use strict';
+
+    // Armazena as imagens capturadas
+    const capturedImages = [];
+    let isCapturing = false;
+
+    // Intercepta a criação de URLs blob
+    const originalCreateObjectURL = URL.createObjectURL;
+    URL.createObjectURL = function(blob) {
+        const blobUrl = originalCreateObjectURL.call(this, blob);
+
+        // Se estamos capturando e é uma imagem, armazena
+        if (isCapturing && blob.type && blob.type.startsWith('image/')) {
+            console.log(`📸 Imagem capturada: ${blob.type}, ${blob.size} bytes`);
+            capturedImages.push({
+                blob: blob,
+                url: blobUrl
+            });
+        }
+
+        return blobUrl;
+    };
 
     // Função auxiliar: espera elemento aparecer
     function waitForElement(selector, callback) {
@@ -29,8 +50,7 @@
     }
 
     /**
-     * Rola a página UMA IMAGEM POR VEZ. O objetivo aqui é fazer o navegador
-     * carregar as imagens na página de forma controlada, sem causar erros 429.
+     * Rola a página UMA IMAGEM POR VEZ para carregar as imagens na página.
      */
     async function triggerImageLoading(btn) {
         console.log("🦾 Iniciando rolagem controlada para carregar as imagens na página...");
@@ -43,9 +63,9 @@
                 const currentPage = pages[i];
                 endCheckCount = 0;
                 const totalPagesEstimate = pages.length > i ? pages.length : i + 1;
-                btn.textContent = `Carregando ${i + 1}/${totalPagesEstimate}...`;
+                btn.textContent = `Carregando ${i + 1}/${totalPagesEstimate}... (${capturedImages.length} imgs)`;
                 currentPage.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                await new Promise(r => setTimeout(r, 500)); // Pausa para garantir carregamento
+                await new Promise(r => setTimeout(r, 1000)); // Pausa para garantir carregamento
                 i++;
             } else {
                 endCheckCount++;
@@ -53,7 +73,7 @@
                 await new Promise(r => setTimeout(r, 1000));
             }
         }
-        console.log(`✅ Todas as ${i} imagens foram carregadas na página.`);
+        console.log(`✅ Todas as ${i} imagens foram carregadas. Total capturado: ${capturedImages.length}`);
         window.scrollTo({ top: 0, behavior: "smooth" });
         await new Promise(r => setTimeout(r, 500));
     }
@@ -71,31 +91,24 @@
             btn.style.cursor = "default";
             btn.style.opacity = "0.7";
 
-            // PASSO 1: Usar a rolagem lenta para carregar tudo na página sem erros.
+            // Limpa capturas anteriores e inicia captura
+            capturedImages.length = 0;
+            isCapturing = true;
+
+            // PASSO 1: Rolar a página para carregar todas as imagens
             await triggerImageLoading(btn);
 
-            btn.textContent = "Coletando URLs...";
-            await new Promise(r => setTimeout(r, 1000)); // Pequena pausa
+            // Para de capturar
+            isCapturing = false;
 
-            // PASSO 2: Pegar as URLs reais da rede, como no seu script.
-            const imageUrls = performance.getEntriesByType("resource")
-                .map(e => e.name)
-                .filter(u => u.startsWith("https://sakuramangas.org/imagens/") && (u.endsWith(".jpg") || u.endsWith(".png")));
+            btn.textContent = "Processando imagens...";
+            await new Promise(r => setTimeout(r, 500));
 
-            let uniqueUrls = [...new Set(imageUrls)];
+            console.log(`🖼️ Total de imagens capturadas: ${capturedImages.length}`);
 
-            // PASSO 2.5: Ordenar as URLs numericamente, pois elas podem vir fora de ordem.
-            const getPageNumber = (url) => {
-                const match = url.match(/\/(\d+)\.(jpg|png)$/);
-                return match ? parseInt(match[1], 10) : 0;
-            };
-            uniqueUrls.sort((a, b) => getPageNumber(a) - getPageNumber(b));
-
-            console.log(`🖼️ URLs reais encontradas e ordenadas: ${uniqueUrls.length}`);
-
-            if (uniqueUrls.length === 0) {
-                 btn.textContent = "Nenhuma imagem!";
-                 setTimeout(() => {
+            if (capturedImages.length === 0) {
+                btn.textContent = "Nenhuma imagem!";
+                setTimeout(() => {
                     btn.textContent = "Download";
                     btn.disabled = false;
                     btn.style.cursor = "pointer";
@@ -110,31 +123,44 @@
             const zipName = `${titulo}-${cap}.zip`;
 
             const zip = new JSZip();
-            const total = uniqueUrls.length;
+            const total = capturedImages.length;
 
-            // PASSO 3: Baixar as URLs reais, uma por uma, com uma pausa generosa.
+            // PASSO 2: Adicionar todas as imagens capturadas ao ZIP
             for (let i = 0; i < total; i++) {
-                const url = uniqueUrls[i];
-                btn.textContent = `Baixando ${i + 1}/${total}...`;
+                btn.textContent = `Adicionando ${i + 1}/${total}...`;
                 try {
-                    const res = await fetch(url);
-                    if (!res.ok) throw new Error(`Falha no fetch: ${res.status}`);
-                    const blob = await res.blob();
-                    const filename = `pagina_${String(i + 1).padStart(3, "0")}.jpg`;
-                    zip.file(filename, blob);
-                    console.log(`📥 ${filename} (de ${url})`);
-                    // PAUSA CRÍTICA PARA EVITAR ERRO 429
-                    await new Promise(r => setTimeout(r, 300));
+                    const imgData = capturedImages[i];
+                    const extension = imgData.blob.type.split('/')[1] || 'jpg';
+                    const filename = `pagina_${String(i + 1).padStart(3, "0")}.${extension}`;
+                    zip.file(filename, imgData.blob);
+                    console.log(`📥 ${filename} adicionado (${imgData.blob.size} bytes)`);
                 } catch (err) {
-                    console.warn("Erro ao baixar:", url, err);
+                    console.warn("Erro ao adicionar imagem:", err);
                 }
             }
 
             btn.textContent = "Compactando ZIP...";
             const content = await zip.generateAsync({ type: "blob" }, (metadata) => {
-                 btn.textContent = `Compactando ${Math.floor(metadata.percent)}%`;
+                btn.textContent = `Compactando ${Math.floor(metadata.percent)}%`;
             });
-            saveAs(content, zipName);
+
+            // Tenta usar saveAs, se falhar usa método manual
+            try {
+                saveAs(content, zipName);
+                console.log(`💾 ZIP salvo via saveAs: ${zipName}`);
+            } catch (err) {
+                console.warn("saveAs falhou, tentando método manual:", err);
+                // Método manual de download
+                const url = URL.createObjectURL(content);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = zipName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                console.log(`💾 ZIP salvo via método manual: ${zipName}`);
+            }
 
             btn.textContent = "Concluído!";
             setTimeout(() => {
